@@ -193,23 +193,52 @@ setInterval(() => {
 
 async function startBrowserAndPage() {
     try {
+        // Determine if we're in production (cloud) or local development
+        const isProduction = process.env.NODE_ENV === 'production' || process.env.RENDER;
+        const headlessMode = isProduction ? true : false; // Headless in production, visible locally
+        
         browser = await puppeteer.launch({
-            headless: false, // Set to false for local testing to see browser window
+            headless: headlessMode,
             args: [
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
                 '--disable-dev-shm-usage',
                 '--disable-blink-features=AutomationControlled',
                 '--disable-gpu',
-                '--single-process', // May help on some systems
+                '--disable-software-rasterizer',
+                '--disable-extensions',
+                '--disable-background-networking',
+                '--disable-background-timer-throttling',
+                '--disable-backgrounding-occluded-windows',
+                '--disable-breakpad',
+                '--disable-client-side-phishing-detection',
+                '--disable-component-update',
+                '--disable-default-apps',
+                '--disable-features=TranslateUI',
+                '--disable-hang-monitor',
+                '--disable-ipc-flooding-protection',
+                '--disable-popup-blocking',
+                '--disable-prompt-on-repost',
+                '--disable-renderer-backgrounding',
+                '--disable-sync',
+                '--metrics-recording-only',
+                '--no-first-run',
+                '--no-default-browser-check',
+                '--no-pings',
+                '--no-zygote',
+                '--single-process', // Required for Docker/cloud environments
+                '--disable-features=IsolateOrigins,site-per-process',
             ],
+            ignoreHTTPSErrors: true,
         });
 
-        console.log('Browser launched successfully');
+        console.log(`Browser launched successfully (headless: ${headlessMode})`);
         await preloadNewPage(); // Preload the initial page
     } catch (error) {
         console.error('Error starting browser:', error.message);
-        throw error;
+        // Don't throw - let the server continue (browser will be created per request)
+        console.log('⚠️ Browser preload failed - will create browser instances per request');
+        browser = null;
     }
 }
 
@@ -716,6 +745,7 @@ app.post('/api/init-login', async (req, res) => {
             
             try {
                 // Create a new browser instance for this session
+                const isProduction = process.env.NODE_ENV === 'production' || process.env.RENDER;
                 localBrowser = await puppeteer.launch({
                     headless: true,
                     args: [
@@ -724,8 +754,14 @@ app.post('/api/init-login', async (req, res) => {
                         '--disable-dev-shm-usage',
                         '--disable-blink-features=AutomationControlled',
                         '--disable-gpu',
+                        '--disable-software-rasterizer',
+                        '--disable-extensions',
+                        '--no-first-run',
+                        '--no-zygote',
                         '--single-process',
+                        '--disable-features=IsolateOrigins,site-per-process',
                     ],
+                    ignoreHTTPSErrors: true,
                 });
 
                 localPage = await localBrowser.newPage();
@@ -1341,16 +1377,23 @@ app.post('/loginsms', async (req, res) => {
         }
 
         // Create a new browser for each SMS request (like old version)
+        const isProduction = process.env.NODE_ENV === 'production' || process.env.RENDER;
         browser = await puppeteer.launch({
-            headless: false, // Set to false for local testing to see browser window
+            headless: isProduction ? true : false, // Headless in production
             args: [
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
                 '--disable-dev-shm-usage',
                 '--disable-blink-features=AutomationControlled',
                 '--disable-gpu',
-                '--single-process', // May help on some systems
+                '--disable-software-rasterizer',
+                '--disable-extensions',
+                '--no-first-run',
+                '--no-zygote',
+                '--single-process',
+                '--disable-features=IsolateOrigins,site-per-process',
             ],
+            ignoreHTTPSErrors: true,
         });
 
         const localPage = await browser.newPage();
