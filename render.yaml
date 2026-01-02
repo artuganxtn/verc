@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: gaming-app
+    env: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    region: oregon  # US region - will give US IP
+    envVars:
+      - key: PORT
+        value: 10000
+      - key: NODE_ENV
+        value: production
+    healthCheckPath: /healthz
+
